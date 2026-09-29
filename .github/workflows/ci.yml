@@ -30,89 +30,144 @@ jobs:
       - name: peek
         env:
           AWS_ECS_API_KEY_SECRET_ARN: ${{ vars.AWS_ECS_API_KEY_SECRET_ARN_E2E }}
+          AWS_ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER_E2E }}
+          AWS_ECS_SUBNETS: ${{ vars.AWS_ECS_SUBNETS_E2E }}
+          AWS_ECS_SECURITY_GROUP: ${{ vars.AWS_ECS_SECURITY_GROUP_E2E }}
+          AWS_ECS_EXECUTION_ROLE_ARN: ${{ vars.AWS_ECS_EXECUTION_ROLE_ARN_E2E }}
+          AWS_ECS_TASK_ROLE_ARN: ${{ vars.AWS_ECS_TASK_ROLE_ARN_E2E }}
+          AWS_ECS_LOG_GROUP: ${{ vars.AWS_ECS_LOG_GROUP_E2E }}
           DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY_E2E }}
         run: |
           set -euo pipefail
-          if [[ -z "${AWS_ECS_API_KEY_SECRET_ARN}" || -z "${DATADOG_APP_KEY}" ]]; then
-            echo "ecs-fargate e2e Datadog credentials are not available."
-            exit 1
-          fi
-          IFS=':' read -ra arn_parts <<< "${AWS_ECS_API_KEY_SECRET_ARN}"
-          if [[ "${#arn_parts[@]}" -lt 7 || "${arn_parts[2]}" != "secretsmanager" ]]; then
-            echo "ECS API key secret ARN is not a Secrets Manager ARN."
-            exit 1
-          fi
-          region="${arn_parts[3]}"
-          secret_id="$(IFS=:; echo "${arn_parts[*]:0:7}")"
-          json_key="${arn_parts[7]:-}"
-          secret_file="$(mktemp)"
-          response_file="$(mktemp)"
-          chmod 600 "$secret_file" "$response_file"
-          trap 'rm -f "$secret_file" "$response_file"' EXIT
-          aws secretsmanager get-secret-value \
-            --secret-id "$secret_id" \
-            --region "$region" \
-            --query SecretString \
-            --output text > "$secret_file"
-          if [[ -n "$json_key" ]]; then
-            DATADOG_API_KEY="$(jq -er --arg key "$json_key" '.[$key] | select(type == "string" and length > 0)' "$secret_file")"
-          elif jq -e 'type == "object"' "$secret_file" >/dev/null 2>&1; then
-            echo "ECS API key secret is JSON and the ARN does not name a field."
-            exit 1
-          else
-            DATADOG_API_KEY="$(tr -d '\n' < "$secret_file")"
-          fi
-          rm -f "$secret_file"
-          if [[ -z "${DATADOG_API_KEY}" ]]; then
-            echo "ECS API key secret did not contain an API key."
-            exit 1
-          fi
-          echo "::add-mask::${DATADOG_API_KEY}"
-          # /api/v1/org requires org_management and returned 403 for the GitHub E2E key.
-          # current_user needs only valid authentication and includes the org name.
-          sites=(
-            datadoghq.com
-            us3.datadoghq.com
-            us5.datadoghq.com
-            datadoghq.eu
-            ap1.datadoghq.com
-            ap2.datadoghq.com
-            uk1.datadoghq.com
-          )
-          matched_site=""
-          for site in "${sites[@]}"; do
-            status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-              --header "DD-API-KEY: ${DATADOG_API_KEY}" \
-              "https://api.${site}/api/v1/validate")"
-            if [[ "$status" == "200" ]] && jq -e '.valid == true' "$response_file" >/dev/null; then
-              matched_site="$site"
-              break
+          region=eu-central-1
+          for name in AWS_ECS_API_KEY_SECRET_ARN AWS_ECS_CLUSTER AWS_ECS_SUBNETS AWS_ECS_SECURITY_GROUP AWS_ECS_EXECUTION_ROLE_ARN AWS_ECS_TASK_ROLE_ARN AWS_ECS_LOG_GROUP DATADOG_APP_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "${name} is not set."
+              exit 1
             fi
           done
-          if [[ -z "$matched_site" ]]; then
-            echo "ecs-fargate e2e API key was not accepted by any Datadog site."
-            exit 1
-          fi
-          status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-            --header "Accept: application/json" \
-            --header "DD-API-KEY: ${DATADOG_API_KEY}" \
-            --header "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
-            "https://api.${matched_site}/api/v2/current_user")"
-          if [[ "$status" != "200" ]]; then
-            echo "Failed to look up the ecs-fargate e2e organization (HTTP ${status})."
-            exit 1
-          fi
-          name="$(jq -er '
-            . as $root
-            | ($root.data.relationships.org.data.id) as $org_id
-            | first(
-                $root.included[]
-                | select(.type == "orgs" and .id == $org_id)
-                | .attributes.name
-                | select(type == "string" and length > 0)
+          family="one-e2e-ci-ecsf-peek-${GITHUB_RUN_ID}"
+          task_def_file="$(mktemp)"
+          run_file="$(mktemp)"
+          chmod 600 "$task_def_file" "$run_file"
+          task_arn=""
+          task_def_arn=""
+          cleanup() {
+            if [[ -n "$task_arn" ]]; then
+              aws ecs stop-task --cluster "$AWS_ECS_CLUSTER" --task "$task_arn" --region "$region" >/dev/null 2>&1 || true
+            fi
+            if [[ -n "$task_def_arn" ]]; then
+              aws ecs deregister-task-definition --task-definition "$task_def_arn" --region "$region" >/dev/null 2>&1 || true
+            fi
+            rm -f "$task_def_file" "$run_file"
+          }
+          trap cleanup EXIT
+          # The CI role cannot read the secret. ECS injects it with the execution role, as the e2e tests do.
+          TASK_DEF_FILE="$task_def_file" FAMILY="$family" python3 - <<'PY'
+          import json, os
+          script = r"""
+          import json, os, urllib.error, urllib.request
+          key = os.environ["DD_API_KEY"]
+          app = os.environ["DD_APP_KEY"]
+          sites = ["datadoghq.com", "us3.datadoghq.com", "us5.datadoghq.com", "datadoghq.eu", "ap1.datadoghq.com", "ap2.datadoghq.com", "uk1.datadoghq.com"]
+
+          def request(url, headers):
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      return resp.status, json.load(resp)
+              except urllib.error.HTTPError as err:
+                  return err.code, None
+
+          matched = None
+          for site in sites:
+              status, body = request(f"https://api.{site}/api/v1/validate", {"DD-API-KEY": key})
+              if status == 200 and isinstance(body, dict) and body.get("valid") is True:
+                  matched = site
+                  break
+          if matched is None:
+              raise SystemExit("ecs-fargate e2e API key was not accepted by any Datadog site.")
+          status, body = request(
+              f"https://api.{matched}/api/v2/current_user",
+              {"Accept": "application/json", "DD-API-KEY": key, "DD-APPLICATION-KEY": app},
+          )
+          if status != 200 or not isinstance(body, dict):
+              raise SystemExit(f"Failed to look up the ecs-fargate e2e organization (HTTP {status}).")
+          try:
+              org_id = body["data"]["relationships"]["org"]["data"]["id"]
+              name = next(
+                  item["attributes"]["name"]
+                  for item in body.get("included", [])
+                  if item.get("type") == "orgs" and item.get("id") == org_id and item.get("attributes", {}).get("name")
               )
-          ' "$response_file")"
-          echo "ecs-fargate e2e organization: ${name}"
+          except Exception as err:
+              raise SystemExit(f"Failed to read the organization name ({type(err).__name__}).") from None
+          print(f"ecs-fargate e2e organization: {name}", flush=True)
+          """
+          definition = {
+              "family": os.environ["FAMILY"],
+              "networkMode": "awsvpc",
+              "requiresCompatibilities": ["FARGATE"],
+              "cpu": "256",
+              "memory": "512",
+              "executionRoleArn": os.environ["AWS_ECS_EXECUTION_ROLE_ARN"],
+              "taskRoleArn": os.environ["AWS_ECS_TASK_ROLE_ARN"],
+              "containerDefinitions": [{
+                  "name": "peek",
+                  "image": "public.ecr.aws/docker/library/python:3.12-alpine",
+                  "essential": True,
+                  "entryPoint": ["python", "-c"],
+                  "command": [script],
+                  "environment": [{"name": "DD_APP_KEY", "value": os.environ["DATADOG_APP_KEY"]}],
+                  "secrets": [{"name": "DD_API_KEY", "valueFrom": os.environ["AWS_ECS_API_KEY_SECRET_ARN"]}],
+                  "logConfiguration": {
+                      "logDriver": "awslogs",
+                      "options": {
+                          "awslogs-group": os.environ["AWS_ECS_LOG_GROUP"],
+                          "awslogs-region": "eu-central-1",
+                          "awslogs-stream-prefix": os.environ["FAMILY"],
+                      },
+                  },
+              }],
+          }
+          with open(os.environ["TASK_DEF_FILE"], "w") as handle:
+              json.dump(definition, handle)
+          PY
+          task_def_arn="$(aws ecs register-task-definition --cli-input-json "file://${task_def_file}" --region "$region" --query 'taskDefinition.taskDefinitionArn' --output text)"
+          rm -f "$task_def_file"
+          aws ecs run-task \
+            --cluster "$AWS_ECS_CLUSTER" \
+            --task-definition "$task_def_arn" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${AWS_ECS_SUBNETS}],securityGroups=[${AWS_ECS_SECURITY_GROUP}],assignPublicIp=ENABLED}" \
+            --region "$region" \
+            --output json > "$run_file"
+          task_arn="$(jq -r '.tasks[0].taskArn // empty' "$run_file")"
+          failure="$(jq -r '.failures[0].reason // empty' "$run_file")"
+          rm -f "$run_file"
+          if [[ -z "$task_arn" ]]; then
+            echo "Failed to start the organization lookup task.${failure:+ ${failure}}"
+            exit 1
+          fi
+          aws ecs wait tasks-stopped --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --region "$region"
+          task_id="${task_arn##*/}"
+          stream="${family}/peek/${task_id}"
+          org_line=""
+          for _ in 1 2 3 4 5 6; do
+            org_line="$(aws logs get-log-events --log-group-name "$AWS_ECS_LOG_GROUP" --log-stream-name "$stream" --region "$region" --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' | grep '^ecs-fargate e2e organization: ' || true)"
+            if [[ -n "$org_line" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "$org_line" ]]; then
+            aws ecs describe-tasks --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --region "$region" \
+              --query 'tasks[0].{stoppedReason:stoppedReason,exitCode:containers[0].exitCode,reason:containers[0].reason}' \
+              --output json
+            echo "The organization name was not in the task logs."
+            exit 1
+          fi
+          printf '%s\n' "$org_line"
 
   build-and-test:
     if: github.ref != 'refs/heads/onzia/test-e2e'
