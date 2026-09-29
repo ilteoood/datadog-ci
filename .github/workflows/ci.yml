@@ -18,29 +18,100 @@ jobs:
   peek:
     name: peek
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_E2E }}
+          aws-region: eu-central-1
       - name: peek
         env:
-          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY_E2E }}
+          AWS_ECS_API_KEY_SECRET_ARN: ${{ vars.AWS_ECS_API_KEY_SECRET_ARN_E2E }}
           DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY_E2E }}
         run: |
           set -euo pipefail
-          if [[ -z "${DATADOG_API_KEY}" || -z "${DATADOG_APP_KEY}" ]]; then
+          if [[ -z "${AWS_ECS_API_KEY_SECRET_ARN}" || -z "${DATADOG_APP_KEY}" ]]; then
             echo "ecs-fargate e2e Datadog credentials are not available."
             exit 1
           fi
+          IFS=':' read -ra arn_parts <<< "${AWS_ECS_API_KEY_SECRET_ARN}"
+          if [[ "${#arn_parts[@]}" -lt 7 || "${arn_parts[2]}" != "secretsmanager" ]]; then
+            echo "ECS API key secret ARN is not a Secrets Manager ARN."
+            exit 1
+          fi
+          region="${arn_parts[3]}"
+          secret_id="$(IFS=:; echo "${arn_parts[*]:0:7}")"
+          json_key="${arn_parts[7]:-}"
+          secret_file="$(mktemp)"
           response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
+          chmod 600 "$secret_file" "$response_file"
+          trap 'rm -f "$secret_file" "$response_file"' EXIT
+          aws secretsmanager get-secret-value \
+            --secret-id "$secret_id" \
+            --region "$region" \
+            --query SecretString \
+            --output text > "$secret_file"
+          if [[ -n "$json_key" ]]; then
+            DATADOG_API_KEY="$(jq -er --arg key "$json_key" '.[$key] | select(type == "string" and length > 0)' "$secret_file")"
+          elif jq -e 'type == "object"' "$secret_file" >/dev/null 2>&1; then
+            echo "ECS API key secret is JSON and the ARN does not name a field."
+            exit 1
+          else
+            DATADOG_API_KEY="$(tr -d '\n' < "$secret_file")"
+          fi
+          rm -f "$secret_file"
+          if [[ -z "${DATADOG_API_KEY}" ]]; then
+            echo "ECS API key secret did not contain an API key."
+            exit 1
+          fi
+          echo "::add-mask::${DATADOG_API_KEY}"
+          # /api/v1/org requires org_management and returned 403 for the GitHub E2E key.
+          # current_user needs only valid authentication and includes the org name.
+          sites=(
+            datadoghq.com
+            us3.datadoghq.com
+            us5.datadoghq.com
+            datadoghq.eu
+            ap1.datadoghq.com
+            ap2.datadoghq.com
+            uk1.datadoghq.com
+          )
+          matched_site=""
+          for site in "${sites[@]}"; do
+            status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+              --header "DD-API-KEY: ${DATADOG_API_KEY}" \
+              "https://api.${site}/api/v1/validate")"
+            if [[ "$status" == "200" ]] && jq -e '.valid == true' "$response_file" >/dev/null; then
+              matched_site="$site"
+              break
+            fi
+          done
+          if [[ -z "$matched_site" ]]; then
+            echo "ecs-fargate e2e API key was not accepted by any Datadog site."
+            exit 1
+          fi
           status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
             --header "Accept: application/json" \
             --header "DD-API-KEY: ${DATADOG_API_KEY}" \
             --header "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
-            "https://api.datadoghq.com/api/v1/org")"
+            "https://api.${matched_site}/api/v2/current_user")"
           if [[ "$status" != "200" ]]; then
             echo "Failed to look up the ecs-fargate e2e organization (HTTP ${status})."
             exit 1
           fi
-          name="$(jq -er '.orgs[0].name | select(type == "string" and length > 0)' "$response_file")"
+          name="$(jq -er '
+            . as $root
+            | ($root.data.relationships.org.data.id) as $org_id
+            | first(
+                $root.included[]
+                | select(.type == "orgs" and .id == $org_id)
+                | .attributes.name
+                | select(type == "string" and length > 0)
+              )
+          ' "$response_file")"
           echo "ecs-fargate e2e organization: ${name}"
 
   build-and-test:
