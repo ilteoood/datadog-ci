@@ -15,7 +15,36 @@ on:
       - '**'
 
 jobs:
+  peek:
+    name: peek
+    runs-on: ubuntu-latest
+    steps:
+      - name: peek
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY_E2E }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY_E2E }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DATADOG_API_KEY}" || -z "${DATADOG_APP_KEY}" ]]; then
+            echo "ecs-fargate e2e Datadog credentials are not available."
+            exit 1
+          fi
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+            --header "Accept: application/json" \
+            --header "DD-API-KEY: ${DATADOG_API_KEY}" \
+            --header "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
+            "https://api.datadoghq.com/api/v1/org")"
+          if [[ "$status" != "200" ]]; then
+            echo "Failed to look up the ecs-fargate e2e organization (HTTP ${status})."
+            exit 1
+          fi
+          name="$(jq -er '.orgs[0].name | select(type == "string" and length > 0)' "$response_file")"
+          echo "ecs-fargate e2e organization: ${name}"
+
   build-and-test:
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +101,7 @@ jobs:
           if-no-files-found: error
 
   unit-tests-windows:
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     strategy:
       fail-fast: false
       matrix:
@@ -659,6 +689,7 @@ jobs:
 
   standalone-binary-test-ubuntu:
     name: Test standalone binary in ubuntu
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -687,6 +718,7 @@ jobs:
 
   standalone-binary-test-ubuntu-arm:
     name: Test standalone binary in ARM ubuntu
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -715,6 +747,7 @@ jobs:
 
   standalone-binary-test-alpine:
     name: Test standalone binary in Alpine
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -778,6 +811,7 @@ jobs:
 
   standalone-binary-test-alpine-arm:
     name: Test standalone binary in ARM Alpine
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -843,6 +877,7 @@ jobs:
 
   standalone-binary-test-windows:
     name: Test standalone binary in windows
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -871,6 +906,7 @@ jobs:
 
   standalone-binary-test-macos:
     name: Test standalone binary in macOS
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     # `macos-latest-large` is an x64 image, and we need it to run the standalone tests
     # https://github.com/actions/runner-images#available-images
     runs-on: macos-latest-large
@@ -901,6 +937,7 @@ jobs:
 
   standalone-binary-test-macos-arm:
     name: Test standalone binary in ARM macOS
+    if: github.ref != 'refs/heads/onzia/test-e2e'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
