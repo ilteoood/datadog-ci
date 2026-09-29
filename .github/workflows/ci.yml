@@ -47,19 +47,20 @@ jobs:
             fi
           done
           family="one-e2e-ci-ecsf-peek-${GITHUB_RUN_ID}"
+          service_name="${family}-svc"
           task_def_file="$(mktemp)"
-          run_file="$(mktemp)"
-          chmod 600 "$task_def_file" "$run_file"
-          task_arn=""
+          chmod 600 "$task_def_file"
           task_def_arn=""
+          service_created=""
           cleanup() {
-            if [[ -n "$task_arn" ]]; then
-              aws ecs stop-task --cluster "$AWS_ECS_CLUSTER" --task "$task_arn" --region "$region" >/dev/null 2>&1 || true
+            if [[ -n "$service_created" ]]; then
+              aws ecs update-service --cluster "$AWS_ECS_CLUSTER" --service "$service_name" --desired-count 0 --region "$region" >/dev/null 2>&1 || true
+              aws ecs delete-service --cluster "$AWS_ECS_CLUSTER" --service "$service_name" --force --region "$region" >/dev/null 2>&1 || true
             fi
             if [[ -n "$task_def_arn" ]]; then
               aws ecs deregister-task-definition --task-definition "$task_def_arn" --region "$region" >/dev/null 2>&1 || true
             fi
-            rm -f "$task_def_file" "$run_file"
+            rm -f "$task_def_file"
           }
           trap cleanup EXIT
           # The CI role cannot read the secret. ECS injects it with the execution role, as the e2e tests do.
@@ -135,35 +136,56 @@ jobs:
           PY
           task_def_arn="$(aws ecs register-task-definition --cli-input-json "file://${task_def_file}" --region "$region" --query 'taskDefinition.taskDefinitionArn' --output text)"
           rm -f "$task_def_file"
-          aws ecs run-task \
+          aws ecs create-service \
             --cluster "$AWS_ECS_CLUSTER" \
+            --service-name "$service_name" \
             --task-definition "$task_def_arn" \
+            --desired-count 1 \
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[${AWS_ECS_SUBNETS}],securityGroups=[${AWS_ECS_SECURITY_GROUP}],assignPublicIp=ENABLED}" \
             --region "$region" \
-            --output json > "$run_file"
-          task_arn="$(jq -r '.tasks[0].taskArn // empty' "$run_file")"
-          failure="$(jq -r '.failures[0].reason // empty' "$run_file")"
-          rm -f "$run_file"
-          if [[ -z "$task_arn" ]]; then
-            echo "Failed to start the organization lookup task.${failure:+ ${failure}}"
-            exit 1
-          fi
-          aws ecs wait tasks-stopped --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --region "$region"
-          task_id="${task_arn##*/}"
-          stream="${family}/peek/${task_id}"
+            --query 'service.serviceName' \
+            --output text >/dev/null
+          service_created=1
           org_line=""
-          for _ in 1 2 3 4 5 6; do
-            org_line="$(aws logs get-log-events --log-group-name "$AWS_ECS_LOG_GROUP" --log-stream-name "$stream" --region "$region" --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' | grep '^ecs-fargate e2e organization: ' || true)"
+          task_arn=""
+          for _ in $(seq 1 36); do
+            for status in RUNNING STOPPED; do
+              task_list="$(aws ecs list-tasks --cluster "$AWS_ECS_CLUSTER" --service-name "$service_name" --desired-status "$status" --region "$region" --query 'taskArns[]' --output text)"
+              for task_arn in $task_list; do
+                if [[ -z "$task_arn" || "$task_arn" == "None" ]]; then
+                  continue
+                fi
+                task_id="${task_arn##*/}"
+                stream="${family}/peek/${task_id}"
+                log_err="$(mktemp)"
+                messages="$(aws logs get-log-events --log-group-name "$AWS_ECS_LOG_GROUP" --log-stream-name "$stream" --region "$region" --query 'events[].message' --output text 2>"$log_err" || true)"
+                if grep -q AccessDenied "$log_err"; then
+                  cat "$log_err"
+                  rm -f "$log_err"
+                  exit 1
+                fi
+                rm -f "$log_err"
+                org_line="$(printf '%s\n' "$messages" | tr '\t' '\n' | grep '^ecs-fargate e2e organization: ' || true)"
+                if [[ -n "$org_line" ]]; then
+                  break
+                fi
+              done
+              if [[ -n "$org_line" ]]; then
+                break
+              fi
+            done
             if [[ -n "$org_line" ]]; then
               break
             fi
             sleep 5
           done
           if [[ -z "$org_line" ]]; then
-            aws ecs describe-tasks --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --region "$region" \
-              --query 'tasks[0].{stoppedReason:stoppedReason,exitCode:containers[0].exitCode,reason:containers[0].reason}' \
-              --output json
+            if [[ -n "$task_arn" && "$task_arn" != "None" ]]; then
+              aws ecs describe-tasks --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --region "$region" \
+                --query 'tasks[0].{stoppedReason:stoppedReason,exitCode:containers[0].exitCode,reason:containers[0].reason}' \
+                --output json
+            fi
             echo "The organization name was not in the task logs."
             exit 1
           fi
